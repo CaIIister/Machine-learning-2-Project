@@ -5,6 +5,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from stable_baselines3 import DQN
 from stable_baselines3.common.vec_env import DummyVecEnv
+from palletizing_dqn import Enhanced3DBoxEnv
 import time
 
 
