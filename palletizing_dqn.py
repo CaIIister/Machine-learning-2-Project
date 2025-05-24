@@ -5,17 +5,21 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 import random
 import torch
+import torch.nn as nn
 import time
 import pickle
 from stable_baselines3 import DQN
 from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.callbacks import BaseCallback
 import warnings
 
 warnings.filterwarnings('ignore')
 
-# Enable CUDA
+# CUDA setup
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"🚀 EMERGENCY FIX - Using device: {device}")
+print(f"Training device: {device}")
+if torch.cuda.is_available():
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
 
 
 class Box:
@@ -36,23 +40,27 @@ class Box:
         return self.size[0] * self.size[1] * self.size[2]
 
 
-class WorkingPalletEnv(gym.Env):
-    """Using the EXACT setup that worked before (80.87 volume)"""
+class OptimizedPalletEnv(gym.Env):
+    """Optimized 3D palletizing environment with improved reward shaping"""
 
     def __init__(self):
-        super(WorkingPalletEnv, self).__init__()
+        super(OptimizedPalletEnv, self).__init__()
         self.pallet_size = (5, 5, 5)
         self.n_boxes = 100
+        self.max_volume = 125  # 5*5*5
 
-        # EXACT same observation as before
+        # Enhanced observation space with spatial features
         pallet_dims = self.pallet_size[0] * self.pallet_size[1] * self.pallet_size[2]
+        height_map_dims = self.pallet_size[0] * self.pallet_size[1]
+
+        # Observation: 3D grid + height map + box info + progress metrics
         self.observation_space = spaces.Box(
             low=0, high=10,
-            shape=(pallet_dims + 6,),  # 125 + 6 = 131 (same as working version)
+            shape=(pallet_dims + height_map_dims + 10,),  # 125 + 25 + 10 = 160
             dtype=np.float32
         )
 
-        # Simple action space (no rotation - this worked!)
+        # Action space: 25 positions
         self.action_space = spaces.Discrete(self.pallet_size[0] * self.pallet_size[1])
 
         self.reset()
@@ -66,40 +74,119 @@ class WorkingPalletEnv(gym.Env):
         self.total_volume_placed = 0
         self.successful_placements = 0
         self.failed_placements = 0
+        self.total_reward = 0
 
         return self._get_obs(), {}
 
+    def _get_height_map(self):
+        """Get 2D height map of current state"""
+        height_map = np.zeros((self.pallet_size[0], self.pallet_size[1]))
+        for x in range(self.pallet_size[0]):
+            for y in range(self.pallet_size[1]):
+                for z in range(self.pallet_size[2] - 1, -1, -1):
+                    if self.occupied[x, y, z] == 1:
+                        height_map[x, y] = z + 1
+                        break
+        return height_map
+
     def _get_obs(self):
-        # EXACT same observation as working version
+        # 3D occupancy grid
         flat_occupied = self.occupied.flatten().astype(np.float32)
 
+        # Height map for spatial awareness
+        height_map = self._get_height_map().flatten().astype(np.float32)
+
+        # Current box information
         if self.current_box_idx < self.n_boxes:
             box = self.box_queue[self.current_box_idx]
             box_info = np.array(list(box.original_size), dtype=np.float32)
         else:
             box_info = np.array([0, 0, 0], dtype=np.float32)
 
-        # Progress info (same as working version)
-        progress_info = np.array([
-            self.current_box_idx / self.n_boxes,  # Progress ratio
-            self.successful_placements / max(1, self.current_box_idx),  # Success rate so far
-            self.total_volume_placed / 125.0  # Volume ratio
+        # Progress and performance metrics
+        progress = self.current_box_idx / self.n_boxes
+        success_rate = self.successful_placements / max(1, self.current_box_idx)
+        volume_efficiency = self.total_volume_placed / self.max_volume
+        failure_rate = self.failed_placements / max(1, self.current_box_idx)
+
+        # Spatial analysis
+        height_variance = np.var(height_map)
+        max_height = np.max(height_map)
+        avg_height = np.mean(height_map)
+
+        metrics = np.array([
+            progress, success_rate, volume_efficiency, failure_rate,
+            height_variance, max_height, avg_height
         ], dtype=np.float32)
 
-        return np.concatenate([flat_occupied, box_info, progress_info])
+        return np.concatenate([flat_occupied, height_map, box_info, metrics])
 
     def is_valid_placement(self, box):
         (x1, x2), (y1, y2), (z1, z2) = box.get_bounds()
 
+        # Bounds check
         if x2 > self.pallet_size[0] or y2 > self.pallet_size[1] or z2 > self.pallet_size[2]:
             return False
 
+        # Collision check
         if np.any(self.occupied[x1:x2, y1:y2, z1:z2] != 0):
             return False
 
+        # Support check
         if z1 == 0:
             return True
         return np.all(self.occupied[x1:x2, y1:y2, z1 - 1:z1] == 1)
+
+    def _calculate_advanced_reward(self, box, z, placed):
+        """Advanced reward function with multiple objectives"""
+        if not placed:
+            return -5.0  # Penalty for failed placement
+
+        volume = box.get_volume()
+
+        # Base volume reward
+        volume_reward = volume * 15.0
+
+        # Height penalty (encourage lower placement)
+        height_penalty = -z * 2.0
+
+        # Stability reward (prefer placements that create flat surfaces)
+        stability_reward = 0
+        x, y = box.position[0], box.position[1]
+        if z == 0:  # Ground level
+            stability_reward = 5.0
+        else:
+            # Check if placement creates a stable platform
+            l, w, h = box.size
+            platform_area = l * w
+            stability_reward = platform_area * 1.0
+
+        # Compactness reward (penalize scattered placement)
+        compactness_reward = 0
+        if self.successful_placements > 0:
+            # Calculate distance to existing boxes
+            min_distance = float('inf')
+            for existing_box in self.placed_boxes[:-1]:  # Exclude current box
+                ex_x, ex_y, ex_z = existing_box.position
+                distance = abs(x - ex_x) + abs(y - ex_y) + abs(z - ex_z)
+                min_distance = min(min_distance, distance)
+
+            if min_distance <= 2:  # Adjacent or close placement
+                compactness_reward = 3.0
+            elif min_distance <= 4:
+                compactness_reward = 1.0
+
+        # Efficiency bonus
+        efficiency_bonus = 0
+        if volume == 8:  # 2x2x2 box
+            efficiency_bonus = 5.0
+        elif volume >= 4:
+            efficiency_bonus = 2.0
+
+        total_reward = (volume_reward + stability_reward +
+                        compactness_reward + efficiency_bonus + height_penalty)
+
+        return total_reward
 
     def step(self, action):
         if self.current_box_idx >= self.n_boxes:
@@ -110,9 +197,9 @@ class WorkingPalletEnv(gym.Env):
         y = action % self.pallet_size[1]
 
         placed = False
-        reward = 0
+        best_z = None
 
-        # Try to place at lowest z
+        # Find lowest valid placement
         for z in range(self.pallet_size[2]):
             box.set_position((x, y, z))
             if self.is_valid_placement(box):
@@ -120,46 +207,54 @@ class WorkingPalletEnv(gym.Env):
                 (x1, x2), (y1, y2), (z1, z2) = box.get_bounds()
                 self.occupied[x1:x2, y1:y2, z1:z2] = 1
 
-                # WORKING reward function (from successful version)
-                volume = box.get_volume()
-                base_reward = volume * 2.0
-                height_bonus = max(0, (self.pallet_size[2] - z) * 0.5)
-                efficiency_bonus = 1.0
-
-                reward = base_reward + height_bonus + efficiency_bonus
-                self.total_volume_placed += volume
+                self.total_volume_placed += box.get_volume()
                 self.successful_placements += 1
                 placed = True
+                best_z = z
                 break
 
         if not placed:
-            reward = -2.0
             self.failed_placements += 1
+            best_z = 0
+
+        # Calculate reward
+        reward = self._calculate_advanced_reward(box, best_z, placed)
+        self.total_reward += reward
 
         self.current_box_idx += 1
         done = self.current_box_idx >= self.n_boxes
 
-        # End-of-episode bonus (from working version)
-        if done and self.successful_placements > 0:
-            efficiency_ratio = self.successful_placements / self.n_boxes
-            volume_ratio = self.total_volume_placed / 125.0
-            bonus = (efficiency_ratio + volume_ratio) * 10
-            reward += bonus
+        # End-of-episode reward
+        if done:
+            final_success_rate = self.successful_placements / self.n_boxes
+            final_volume_efficiency = self.total_volume_placed / self.max_volume
+
+            # Bonus for high performance
+            if final_success_rate > 0.5:
+                reward += 50.0 * final_success_rate
+            if final_volume_efficiency > 0.7:
+                reward += 100.0 * final_volume_efficiency
+
+            # Penalty for poor performance
+            if final_success_rate < 0.3:
+                reward -= 25.0
 
         return self._get_obs(), reward, done, False, {
             'placed': placed,
             'volume': box.get_volume() if placed else 0,
             'total_volume': self.total_volume_placed,
             'successful_placements': self.successful_placements,
-            'failed_placements': self.failed_placements
+            'failed_placements': self.failed_placements,
+            'success_rate': self.successful_placements / max(1, self.current_box_idx),
+            'volume_efficiency': self.total_volume_placed / self.max_volume
         }
 
-    def render(self, title="Box Placement"):
+    def render(self, title="3D Palletizing Result"):
         fig = plt.figure(figsize=(12, 10))
         ax = fig.add_subplot(111, projection='3d')
 
         if len(self.placed_boxes) > 0:
-            colors = plt.cm.Set3(np.linspace(0, 1, len(self.placed_boxes)))
+            colors = plt.cm.tab10(np.linspace(0, 1, len(self.placed_boxes)))
 
             for i, box in enumerate(self.placed_boxes):
                 x, y, z = box.position
@@ -174,12 +269,12 @@ class WorkingPalletEnv(gym.Env):
         ax.set_zlabel('Z')
 
         success_rate = self.successful_placements / max(1, self.current_box_idx)
-        volume_efficiency = self.total_volume_placed / 125.0
+        volume_efficiency = self.total_volume_placed / self.max_volume
 
         ax.set_title(f'{title}\n'
-                     f'Boxes: {self.successful_placements}/{self.current_box_idx} '
+                     f'Placed: {self.successful_placements}/{self.current_box_idx} boxes '
                      f'(Success: {success_rate:.1%})\n'
-                     f'Volume: {self.total_volume_placed}/125 '
+                     f'Volume: {self.total_volume_placed}/{self.max_volume} '
                      f'(Efficiency: {volume_efficiency:.1%})')
         plt.tight_layout()
         plt.show()
@@ -201,98 +296,170 @@ class WorkingPalletEnv(gym.Env):
         ax.add_collection3d(box_collection)
 
 
-def create_working_dqn_model(env, neurons_per_layer):
-    """Use EXACT hyperparameters that worked before"""
+class LearningRateScheduler(BaseCallback):
+    """Adaptive learning rate scheduler"""
+
+    def __init__(self, initial_lr=1e-3, decay_factor=0.95, decay_interval=10000):
+        super().__init__()
+        self.initial_lr = initial_lr
+        self.decay_factor = decay_factor
+        self.decay_interval = decay_interval
+
+    def _on_step(self) -> bool:
+        if self.num_timesteps % self.decay_interval == 0:
+            new_lr = self.initial_lr * (self.decay_factor ** (self.num_timesteps // self.decay_interval))
+            self.model.policy.optimizer.param_groups[0]['lr'] = new_lr
+        return True
+
+
+def create_optimized_dqn_model(env, neurons_per_layer):
+    """Create optimized DQN with advanced hyperparameters"""
+
+    # Network architecture: deeper networks for complex patterns
+    if neurons_per_layer <= 64:
+        net_arch = [neurons_per_layer, neurons_per_layer, neurons_per_layer // 2]
+    elif neurons_per_layer <= 256:
+        net_arch = [neurons_per_layer, neurons_per_layer, neurons_per_layer // 2, neurons_per_layer // 4]
+    else:
+        net_arch = [neurons_per_layer, neurons_per_layer, neurons_per_layer // 2,
+                    neurons_per_layer // 4, neurons_per_layer // 8]
 
     policy_kwargs = {
-        'net_arch': [neurons_per_layer, neurons_per_layer],  # 2 layers
+        'net_arch': net_arch,
         'activation_fn': torch.nn.ReLU,
+        'normalize_images': False,
     }
 
-    # EXACT same hyperparameters as working version
     model = DQN(
         "MlpPolicy",
         env,
         policy_kwargs=policy_kwargs,
-        learning_rate=1e-3,
-        buffer_size=100000,  # Large buffer
-        learning_starts=10000,  # More exploration
-        batch_size=128,  # Larger batches
-        tau=1.0,
-        gamma=0.95,
-        train_freq=4,
-        gradient_steps=1,
-        target_update_interval=2000,
-        exploration_fraction=0.4,
+        learning_rate=2e-3,  # Higher initial learning rate
+        buffer_size=200000,  # Larger experience buffer
+        learning_starts=15000,  # More initial exploration
+        batch_size=256,  # Larger batch size for stability
+        tau=0.005,  # Soft target updates
+        gamma=0.99,  # Higher discount factor
+        train_freq=8,  # More frequent training
+        gradient_steps=2,  # Multiple gradient steps per update
+        target_update_interval=5000,  # Less frequent hard updates
+        exploration_fraction=0.6,  # Extended exploration period
         exploration_initial_eps=1.0,
-        exploration_final_eps=0.1,
-        max_grad_norm=10,
+        exploration_final_eps=0.02,  # Lower final exploration
+        max_grad_norm=1.0,  # Gradient clipping
         verbose=0,
-        device=device
+        device=device,
+        optimize_memory_usage=True
     )
 
     return model
 
 
-def test_working_config(neurons, config_id, total_timesteps=120000):
-    """Test with WORKING configuration"""
-    print(f"\n--- Configuration {config_id}: {neurons} neurons (WORKING VERSION) ---")
+def evaluate_model_comprehensive(model, n_episodes=15):
+    """Comprehensive model evaluation with detailed metrics"""
+    results = {
+        'volumes': [],
+        'success_rates': [],
+        'volume_efficiencies': [],
+        'decision_times': [],
+        'boxes_placed': [],
+        'failed_placements': []
+    }
 
-    # Create environment using working setup
-    def make_env():
-        return WorkingPalletEnv()
-
-    env = WorkingPalletEnv()
-    vec_env = DummyVecEnv([make_env])
-
-    # Create model with working hyperparameters
-    model = create_working_dqn_model(vec_env, neurons)
-
-    # Train with MORE timesteps (this worked before!)
-    start_time = time.time()
-    print("Training (120k timesteps)...")
-    model.learn(total_timesteps=total_timesteps, progress_bar=True)
-    training_time = time.time() - start_time
-
-    # Evaluate
-    print("Evaluating...")
-    volumes = []
-    success_rates = []
-
-    for episode in range(12):
-        test_env = WorkingPalletEnv()
-        obs, _ = test_env.reset(seed=episode + 50)
+    for episode in range(n_episodes):
+        env = OptimizedPalletEnv()
+        obs, _ = env.reset(seed=episode + 1000)  # Different seeds for evaluation
 
         total_volume = 0
         boxes_placed = 0
+        failed_placements = 0
+        episode_time = 0
 
-        for step in range(test_env.n_boxes):
+        for step in range(env.n_boxes):
+            start_time = time.time()
             action, _ = model.predict(obs, deterministic=True)
-            obs, reward, done, _, info = test_env.step(action)
+            decision_time = time.time() - start_time
+            episode_time += decision_time
+
+            obs, reward, done, _, info = env.step(action)
 
             if info['placed']:
                 boxes_placed += 1
                 total_volume += info['volume']
+            else:
+                failed_placements += 1
 
             if done:
                 break
 
-        success_rate = boxes_placed / test_env.n_boxes
-        volumes.append(total_volume)
-        success_rates.append(success_rate)
+        success_rate = boxes_placed / env.n_boxes
+        volume_efficiency = total_volume / env.max_volume
 
-        # Show visualization for first config
-        if config_id == 1 and episode == 0:
-            test_env.render(f"Working DQN {neurons} neurons - Episode {episode + 1}")
+        results['volumes'].append(total_volume)
+        results['success_rates'].append(success_rate)
+        results['volume_efficiencies'].append(volume_efficiency)
+        results['decision_times'].append(episode_time / env.n_boxes)
+        results['boxes_placed'].append(boxes_placed)
+        results['failed_placements'].append(failed_placements)
 
-    avg_volume = np.mean(volumes)
-    avg_success = np.mean(success_rates)
-    std_volume = np.std(volumes)
-    std_success = np.std(success_rates)
+    return results
 
-    print(f"Results: Volume={avg_volume:.2f}±{std_volume:.2f}, "
-          f"Success={avg_success:.3f}±{std_success:.3f}, "
-          f"Training time: {training_time:.1f}s")
+
+def test_network_configuration(neurons, config_id, total_timesteps=150000):
+    """Test a single network configuration with optimized training"""
+    print(f"\nConfiguration {config_id}: {neurons} neurons per layer")
+    print("-" * 50)
+
+    # Create environment
+    def make_env():
+        return OptimizedPalletEnv()
+
+    env = OptimizedPalletEnv()
+    vec_env = DummyVecEnv([make_env])
+
+    # Create optimized model
+    model = create_optimized_dqn_model(vec_env, neurons)
+
+    # Setup callbacks
+    lr_scheduler = LearningRateScheduler()
+
+    # Training
+    start_time = time.time()
+    print(f"Training for {total_timesteps:,} timesteps...")
+    model.learn(total_timesteps=total_timesteps, callback=lr_scheduler, progress_bar=True)
+    training_time = time.time() - start_time
+
+    # Evaluation
+    print("Evaluating performance...")
+    results = evaluate_model_comprehensive(model, n_episodes=15)
+
+    # Calculate statistics
+    avg_volume = np.mean(results['volumes'])
+    std_volume = np.std(results['volumes'])
+    avg_success = np.mean(results['success_rates'])
+    std_success = np.std(results['success_rates'])
+    avg_efficiency = np.mean(results['volume_efficiencies'])
+    avg_decision_time = np.mean(results['decision_times'])
+
+    print(f"Results:")
+    print(f"  Volume: {avg_volume:.2f} ± {std_volume:.2f}")
+    print(f"  Success Rate: {avg_success:.3f} ± {std_success:.3f}")
+    print(f"  Volume Efficiency: {avg_efficiency:.3f}")
+    print(f"  Decision Time: {avg_decision_time:.6f}s")
+    print(f"  Training Time: {training_time:.1f}s")
+
+    # Show visualization for first configuration
+    if config_id == 1:
+        test_env = OptimizedPalletEnv()
+        obs, _ = test_env.reset(seed=999)
+
+        for step in range(test_env.n_boxes):
+            action, _ = model.predict(obs, deterministic=True)
+            obs, reward, done, _, info = test_env.step(action)
+            if done:
+                break
+
+        test_env.render(f"Optimized DQN - {neurons} neurons")
 
     return {
         'neurons': neurons,
@@ -300,31 +467,31 @@ def test_working_config(neurons, config_id, total_timesteps=120000):
         'std_volume': std_volume,
         'avg_success': avg_success,
         'std_success': std_success,
+        'avg_efficiency': avg_efficiency,
+        'avg_decision_time': avg_decision_time,
         'training_time': training_time,
-        'volumes': volumes,
-        'success_rates': success_rates
+        'all_results': results
     }
 
 
-def run_emergency_working_experiment():
-    """Emergency experiment using WORKING configuration"""
+def run_complete_network_analysis():
+    """Run comprehensive analysis of 5 network configurations"""
 
-    print("🚨 EMERGENCY: USING WORKING DQN CONFIGURATION")
-    print("=" * 60)
+    print("DQN Network Architecture Analysis")
+    print("=" * 50)
 
-    # 5 network configurations using WORKING setup
+    # Test 5 different network configurations
     network_configs = [32, 64, 128, 256, 512]
-
     results = {}
 
     # Random baseline
-    print("\n🎲 Random Baseline (Working Environment)")
-    random_volumes = []
-    random_success = []
+    print("\nRandom Baseline Evaluation")
+    print("-" * 30)
 
-    for episode in range(12):
-        env = WorkingPalletEnv()
-        obs, _ = env.reset(seed=episode + 100)
+    random_results = []
+    for episode in range(15):
+        env = OptimizedPalletEnv()
+        obs, _ = env.reset(seed=episode + 2000)
 
         total_volume = 0
         boxes_placed = 0
@@ -340,174 +507,203 @@ def run_emergency_working_experiment():
             if done:
                 break
 
-        random_volumes.append(total_volume)
-        random_success.append(boxes_placed / env.n_boxes)
+        success_rate = boxes_placed / env.n_boxes
+        volume_efficiency = total_volume / env.max_volume
+        random_results.append({
+            'volume': total_volume,
+            'success_rate': success_rate,
+            'volume_efficiency': volume_efficiency
+        })
 
-    random_result = {
-        'avg_volume': np.mean(random_volumes),
-        'std_volume': np.std(random_volumes),
-        'avg_success': np.mean(random_success),
-        'std_success': np.std(random_success)
+    random_baseline = {
+        'avg_volume': np.mean([r['volume'] for r in random_results]),
+        'std_volume': np.std([r['volume'] for r in random_results]),
+        'avg_success': np.mean([r['success_rate'] for r in random_results]),
+        'std_success': np.std([r['success_rate'] for r in random_results]),
+        'avg_efficiency': np.mean([r['volume_efficiency'] for r in random_results])
     }
 
-    print(f"Random: Volume={random_result['avg_volume']:.2f}±{random_result['std_volume']:.2f}, "
-          f"Success={random_result['avg_success']:.3f}±{random_result['std_success']:.3f}")
+    print(f"Random Performance:")
+    print(f"  Volume: {random_baseline['avg_volume']:.2f} ± {random_baseline['std_volume']:.2f}")
+    print(f"  Success Rate: {random_baseline['avg_success']:.3f} ± {random_baseline['std_success']:.3f}")
+    print(f"  Volume Efficiency: {random_baseline['avg_efficiency']:.3f}")
 
-    # Test all 5 configurations with WORKING setup
+    # Test each network configuration
     for i, neurons in enumerate(network_configs):
-        result = test_working_config(neurons, i + 1, total_timesteps=120000)
+        result = test_network_configuration(neurons, i + 1, total_timesteps=150000)
         results[neurons] = result
 
-    return results, random_result
+    return results, random_baseline
 
 
-def create_emergency_plots(results, random_result):
-    """Create plots for emergency results"""
+def create_performance_analysis(results, random_baseline):
+    """Create comprehensive performance analysis plots"""
 
     configs = sorted(results.keys())
 
-    avg_volumes = [results[config]['avg_volume'] for config in configs]
-    std_volumes = [results[config]['std_volume'] for config in configs]
-
-    avg_success_rates = [results[config]['avg_success'] for config in configs]
-    std_success_rates = [results[config]['std_success'] for config in configs]
-
+    # Extract metrics
+    volumes = [results[config]['avg_volume'] for config in configs]
+    volume_stds = [results[config]['std_volume'] for config in configs]
+    success_rates = [results[config]['avg_success'] for config in configs]
+    success_stds = [results[config]['std_success'] for config in configs]
+    efficiencies = [results[config]['avg_efficiency'] for config in configs]
     training_times = [results[config]['training_time'] for config in configs]
 
-    # Create plots
-    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-    fig.suptitle('🚨 EMERGENCY FIX: Working DQN - 5 Network Configurations', fontsize=16)
+    # Create comprehensive plot
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    fig.suptitle('DQN Network Architecture Performance Analysis', fontsize=16, fontweight='bold')
 
-    # Volume comparison
+    # Volume performance
     x_pos = range(len(configs))
-    bars1 = axes[0].bar(x_pos, avg_volumes, yerr=std_volumes, capsize=5,
-                        color='green', alpha=0.8, label='Working DQN')
-    axes[0].axhline(y=random_result['avg_volume'], color='red', linestyle='--',
-                    label=f"Random: {random_result['avg_volume']:.1f}")
-    axes[0].set_xlabel('Neurons per Layer')
-    axes[0].set_ylabel('Average Volume Placed')
-    axes[0].set_title('Volume Efficiency (FIXED)')
-    axes[0].set_xticks(x_pos)
-    axes[0].set_xticklabels(configs)
-    axes[0].legend()
-    axes[0].grid(True, alpha=0.3)
+    bars1 = axes[0, 0].bar(x_pos, volumes, yerr=volume_stds, capsize=5,
+                           color='steelblue', alpha=0.8, edgecolor='black')
+    axes[0, 0].axhline(y=random_baseline['avg_volume'], color='red', linestyle='--',
+                       linewidth=2, label=f"Random: {random_baseline['avg_volume']:.1f}")
+    axes[0, 0].set_xlabel('Network Size (neurons per layer)')
+    axes[0, 0].set_ylabel('Average Volume Placed')
+    axes[0, 0].set_title('Volume Efficiency by Network Size')
+    axes[0, 0].set_xticks(x_pos)
+    axes[0, 0].set_xticklabels(configs)
+    axes[0, 0].legend()
+    axes[0, 0].grid(True, alpha=0.3)
 
-    # Add improvement indicators
-    for i, (v, std) in enumerate(zip(avg_volumes, std_volumes)):
-        improvement = (v - random_result['avg_volume']) / random_result['avg_volume'] * 100
+    # Add improvement percentages
+    for i, (v, std) in enumerate(zip(volumes, volume_stds)):
+        improvement = (v - random_baseline['avg_volume']) / random_baseline['avg_volume'] * 100
         color = 'green' if improvement > 0 else 'red'
-        axes[0].text(i, v + std + 1, f'{v:.1f}\n({improvement:+.1f}%)',
-                     ha='center', va='bottom', fontweight='bold', color=color)
+        axes[0, 0].text(i, v + std + 1, f'{improvement:+.1f}%',
+                        ha='center', va='bottom', fontweight='bold', color=color)
 
-    # Success rate comparison
-    bars2 = axes[1].bar(x_pos, avg_success_rates, yerr=std_success_rates, capsize=5,
-                        color='blue', alpha=0.8, label='Working DQN')
-    axes[1].axhline(y=random_result['avg_success'], color='red', linestyle='--',
-                    label=f"Random: {random_result['avg_success']:.3f}")
-    axes[1].set_xlabel('Neurons per Layer')
-    axes[1].set_ylabel('Average Success Rate')
-    axes[1].set_title('Success Rate (FIXED)')
-    axes[1].set_xticks(x_pos)
-    axes[1].set_xticklabels(configs)
-    axes[1].legend()
-    axes[1].grid(True, alpha=0.3)
+    # Success rates
+    bars2 = axes[0, 1].bar(x_pos, success_rates, yerr=success_stds, capsize=5,
+                           color='forestgreen', alpha=0.8, edgecolor='black')
+    axes[0, 1].axhline(y=random_baseline['avg_success'], color='red', linestyle='--',
+                       linewidth=2, label=f"Random: {random_baseline['avg_success']:.3f}")
+    axes[0, 1].set_xlabel('Network Size (neurons per layer)')
+    axes[0, 1].set_ylabel('Success Rate')
+    axes[0, 1].set_title('Placement Success Rate')
+    axes[0, 1].set_xticks(x_pos)
+    axes[0, 1].set_xticklabels(configs)
+    axes[0, 1].legend()
+    axes[0, 1].grid(True, alpha=0.3)
 
-    # Training time
-    bars3 = axes[2].bar(x_pos, training_times, color='orange', alpha=0.8)
-    axes[2].set_xlabel('Neurons per Layer')
-    axes[2].set_ylabel('Training Time (seconds)')
-    axes[2].set_title('Training Time (120k steps)')
-    axes[2].set_xticks(x_pos)
-    axes[2].set_xticklabels(configs)
-    axes[2].grid(True, alpha=0.3)
+    # Volume efficiency
+    bars3 = axes[1, 0].bar(x_pos, efficiencies, color='orange', alpha=0.8, edgecolor='black')
+    axes[1, 0].axhline(y=random_baseline['avg_efficiency'], color='red', linestyle='--',
+                       linewidth=2, label=f"Random: {random_baseline['avg_efficiency']:.3f}")
+    axes[1, 0].set_xlabel('Network Size (neurons per layer)')
+    axes[1, 0].set_ylabel('Volume Efficiency (fraction of max)')
+    axes[1, 0].set_title('Space Utilization Efficiency')
+    axes[1, 0].set_xticks(x_pos)
+    axes[1, 0].set_xticklabels(configs)
+    axes[1, 0].legend()
+    axes[1, 0].grid(True, alpha=0.3)
 
-    for i, v in enumerate(training_times):
-        axes[2].text(i, v + 5, f'{v:.0f}s', ha='center', va='bottom', fontweight='bold')
+    # Training efficiency
+    bars4 = axes[1, 1].bar(x_pos, training_times, color='purple', alpha=0.8, edgecolor='black')
+    axes[1, 1].set_xlabel('Network Size (neurons per layer)')
+    axes[1, 1].set_ylabel('Training Time (seconds)')
+    axes[1, 1].set_title('Training Efficiency')
+    axes[1, 1].set_xticks(x_pos)
+    axes[1, 1].set_xticklabels(configs)
+    axes[1, 1].grid(True, alpha=0.3)
+
+    # Add training time labels
+    for i, t in enumerate(training_times):
+        axes[1, 1].text(i, t + 5, f'{t:.0f}s', ha='center', va='bottom', fontweight='bold')
 
     plt.tight_layout()
     plt.show()
 
 
-def print_emergency_summary(results, random_result):
-    """Print emergency results summary"""
+def print_comprehensive_summary(results, random_baseline):
+    """Print detailed performance summary"""
 
     print("\n" + "=" * 90)
-    print("🚨 EMERGENCY FIX RESULTS - WORKING DQN CONFIGURATION")
+    print("COMPREHENSIVE DQN PERFORMANCE ANALYSIS")
     print("=" * 90)
-    print(f"{'Config':<8} {'Volume':<12} {'Success':<12} {'Improvement':<15} {'Status':<15} {'Time':<8}")
+    print(f"{'Config':<8} {'Volume':<12} {'Success':<10} {'Efficiency':<12} {'Improvement':<12} {'Status':<10}")
     print("-" * 90)
 
-    baseline_volume = random_result['avg_volume']
-    baseline_success = random_result['avg_success']
-
-    print(
-        f"{'Random':<8} {baseline_volume:<12.2f} {baseline_success:<12.3f} {'Baseline':<15} {'Reference':<15} {'N/A':<8}")
+    # Random baseline
+    print(f"{'Random':<8} {random_baseline['avg_volume']:<12.2f} "
+          f"{random_baseline['avg_success']:<10.3f} {random_baseline['avg_efficiency']:<12.3f} "
+          f"{'Baseline':<12} {'Reference':<10}")
 
     successful_configs = 0
     best_volume = 0
     best_config = None
+    improvements = []
 
     for neurons in sorted(results.keys()):
         data = results[neurons]
-        volume_improvement = (data['avg_volume'] - baseline_volume) / baseline_volume * 100
+        volume_improvement = (data['avg_volume'] - random_baseline['avg_volume']) / random_baseline['avg_volume'] * 100
+        improvements.append(volume_improvement)
 
-        if data['avg_volume'] > baseline_volume:
-            status = "✅ SUCCESS"
+        if data['avg_volume'] > random_baseline['avg_volume']:
+            status = "SUCCESS"
             successful_configs += 1
             if data['avg_volume'] > best_volume:
                 best_volume = data['avg_volume']
                 best_config = neurons
         else:
-            status = "❌ FAILED"
+            status = "FAILED"
 
-        print(f"{neurons:<8} {data['avg_volume']:<12.2f} {data['avg_success']:<12.3f} "
-              f"{volume_improvement:+6.1f}%{'':<8} {status:<15} {data['training_time']:<7.0f}s")
+        print(f"{neurons:<8} {data['avg_volume']:<12.2f} {data['avg_success']:<10.3f} "
+              f"{data['avg_efficiency']:<12.3f} {volume_improvement:<+11.1f}% {status:<10}")
 
-    print(f"\n🎯 EMERGENCY RESULTS SUMMARY:")
-    print(f"   ✅ Successful configs: {successful_configs}/5")
-    print(f"   🏆 Best config: {best_config} neurons ({best_volume:.2f} volume)")
-    print(f"   📈 Best improvement: {((best_volume - baseline_volume) / baseline_volume * 100):+.1f}%")
+    print("\n" + "=" * 90)
+    print("PERFORMANCE SUMMARY")
+    print("=" * 90)
+    print(f"Successful configurations: {successful_configs}/5")
+    print(f"Best performing network: {best_config} neurons")
+    print(f"Best volume achieved: {best_volume:.2f}")
+    print(f"Best improvement: {max(improvements):+.1f}% over random")
+    print(f"Average improvement: {np.mean(improvements):+.1f}% over random")
+    print(f"Training device: {device}")
 
-    if successful_configs >= 3:
-        print(f"   🎉 RECOVERY SUCCESSFUL! You have working results for your report!")
+    if successful_configs >= 4:
+        print("RESULT: Excellent performance across network sizes")
+    elif successful_configs >= 3:
+        print("RESULT: Good performance with optimal network size identification")
+    elif successful_configs >= 2:
+        print("RESULT: Moderate success with clear network size preferences")
     else:
-        print(f"   ⚠️  Only {successful_configs} configs working. May need more debugging.")
+        print("RESULT: Limited success - may require further optimization")
 
 
 # Main execution
 if __name__ == "__main__":
-    print("🚨 EMERGENCY DQN FIX - USING PROVEN WORKING CONFIGURATION")
-    print("=" * 70)
+    print("Professional DQN Implementation for 3D Palletizing")
+    print("=" * 60)
 
-    # Set seeds
+    # Set random seeds for reproducibility
     np.random.seed(42)
     random.seed(42)
     torch.manual_seed(42)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(42)
 
-    # Run emergency experiment
-    results, random_result = run_emergency_working_experiment()
+    # Run comprehensive analysis
+    results, random_baseline = run_complete_network_analysis()
 
-    # Create visualization
-    create_emergency_plots(results, random_result)
+    # Create visualizations
+    create_performance_analysis(results, random_baseline)
 
     # Print summary
-    print_emergency_summary(results, random_result)
+    print_comprehensive_summary(results, random_baseline)
 
     # Save results
-    emergency_data = {
-        'emergency_dqn_results': results,
-        'random_baseline': random_result,
+    final_data = {
+        'dqn_network_analysis': results,
+        'random_baseline': random_baseline,
         'device_used': str(device),
         'configurations_tested': sorted(results.keys()),
-        'note': 'Emergency fix using working DQN configuration'
+        'training_timesteps': 150000,
+        'environment_type': 'OptimizedPalletEnv'
     }
 
-    with open('emergency_working_dqn_results.pkl', 'wb') as f:
-        pickle.dump(emergency_data, f)
+    with open('dqn_network_analysis_results.pkl', 'wb') as f:
+        pickle.dump(final_data, f)
 
-    print(f"\n🚨 EMERGENCY EXPERIMENT COMPLETED!")
-    print(f"Results saved to 'emergency_working_dqn_results.pkl'")
-    print(f"Training performed on: {device}")
-    print("=" * 70)
+    print("\nAnalysis completed and saved to 'dqn_network_analysis_results.pkl'")
