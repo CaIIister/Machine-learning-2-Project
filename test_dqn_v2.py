@@ -24,6 +24,9 @@ except ImportError as e:
     print(f"❌ Import Error: {e}")
     sys.exit(1)
 
+# CUDA setup
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
 class TestResults:
     """Class to track test results"""
@@ -57,6 +60,38 @@ class TestResults:
                 if not test['passed']:
                     print(f"  - {test['name']}: {test['details']}")
         return self.failed == 0
+
+
+def create_fast_dqn_model(env, neurons_per_layer):
+    """Create DQN optimized for fast testing"""
+
+    policy_kwargs = {
+        'net_arch': [neurons_per_layer, neurons_per_layer // 2],
+        'activation_fn': torch.nn.ReLU,
+    }
+
+    model = DQN(
+        "MlpPolicy",
+        env,
+        policy_kwargs=policy_kwargs,
+        learning_rate=3e-3,  # Higher learning rate for fast learning
+        buffer_size=10000,  # Smaller buffer
+        learning_starts=500,  # Start learning quickly
+        batch_size=64,
+        tau=0.1,  # Faster target updates
+        gamma=0.95,  # Lower discount for faster learning
+        train_freq=4,
+        gradient_steps=2,
+        target_update_interval=500,  # More frequent updates
+        exploration_fraction=0.5,
+        exploration_initial_eps=1.0,
+        exploration_final_eps=0.1,
+        max_grad_norm=1.0,
+        verbose=0,
+        device=device
+    )
+
+    return model
 
 
 def test_box_class():
@@ -173,7 +208,6 @@ def test_environment_step():
                 results.add_test("Info contains expected keys", info_keys_valid)
 
         # Test placement tracking
-        initial_placements = env.successful_placements
         results.add_test("Placement tracking works", env.current_box_idx == 10)
         results.add_test("Some boxes placed or failed",
                          env.successful_placements + env.failed_placements == 10)
@@ -219,36 +253,7 @@ def test_reward_calculation():
     return results.summary()
 
 
-def create_fast_dqn_model(env, neurons_per_layer):
-    """Create DQN optimized for fast testing"""
-
-    policy_kwargs = {
-        'net_arch': [neurons_per_layer, neurons_per_layer // 2],
-        'activation_fn': torch.nn.ReLU,
-    }
-
-    model = DQN(
-        "MlpPolicy",
-        env,
-        policy_kwargs=policy_kwargs,
-        learning_rate=3e-3,  # Higher learning rate for fast learning
-        buffer_size=10000,  # Smaller buffer
-        learning_starts=500,  # Start learning quickly
-        batch_size=64,
-        tau=0.1,  # Faster target updates
-        gamma=0.95,  # Lower discount for faster learning
-        train_freq=4,
-        gradient_steps=2,
-        target_update_interval=500,  # More frequent updates
-        exploration_fraction=0.5,
-        exploration_initial_eps=1.0,
-        exploration_final_eps=0.1,
-        max_grad_norm=1.0,
-        verbose=0,
-        device=device
-    )
-
-    return model
+def test_model_creation():
     """Test DQN model creation"""
     print("\n🧪 Testing Model Creation")
     results = TestResults()
@@ -264,6 +269,11 @@ def create_fast_dqn_model(env, neurons_per_layer):
             results.add_test(f"Model has policy ({neurons} neurons)", hasattr(model, 'policy'))
             results.add_test(f"Model has correct device ({neurons} neurons)",
                              str(model.device) in ['cpu', 'cuda', 'cuda:0'])
+
+        # Test fast model creation
+        fast_model = create_fast_dqn_model(vec_env, 64)
+        results.add_test("Fast model creation", fast_model is not None)
+        results.add_test("Fast model has policy", hasattr(fast_model, 'policy'))
 
     except Exception as e:
         results.add_test("Model creation exception", False, str(e))
@@ -441,7 +451,7 @@ def test_performance_benchmark():
     try:
         env = OptimizedPalletEnv()
         vec_env = DummyVecEnv([lambda: OptimizedPalletEnv()])
-        model = create_optimized_dqn_model(vec_env, 64)
+        model = create_fast_dqn_model(vec_env, 64)
 
         # Benchmark environment steps
         obs, _ = env.reset(seed=42)
