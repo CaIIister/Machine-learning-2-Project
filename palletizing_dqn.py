@@ -49,17 +49,24 @@ class OptimizedPalletEnv(gym.Env):
         self.n_boxes = 100
         self.max_volume = 125  # 5*5*5
 
-        # Enhanced observation space
-        self.observation_space = spaces.Dict({
-            'grid': spaces.Box(low=0, high=1, shape=self.pallet_size, dtype=np.float32),
-            'height_map': spaces.Box(low=0, high=self.pallet_size[2], shape=(self.pallet_size[0], self.pallet_size[1]), dtype=np.float32),
-            'current_box': spaces.Box(low=1, high=2, shape=(3,), dtype=np.float32),
-            'metrics': spaces.Box(low=0, high=1, shape=(4,), dtype=np.float32)
-        })
+        # Simplified observation space
+        total_obs_size = (
+            np.prod(self.pallet_size) +  # 3D grid
+            self.pallet_size[0] * self.pallet_size[1] +  # height map
+            3 +  # current box dimensions
+            4   # metrics
+        )
+        
+        self.observation_space = spaces.Box(
+            low=0,
+            high=1,
+            shape=(total_obs_size,),
+            dtype=np.float32
+        )
 
         # Action space: 25 positions
         self.action_space = spaces.Discrete(self.pallet_size[0] * self.pallet_size[1])
-
+        
         self.reset()
 
     def reset(self, seed=None, options=None):
@@ -87,25 +94,32 @@ class OptimizedPalletEnv(gym.Env):
         return height_map
 
     def _get_obs(self):
-        # Convert to proper observation format
-        obs = {
-            'grid': self.occupied.astype(np.float32),
-            'height_map': self._get_height_map().astype(np.float32),
-            'current_box': np.array(self.box_queue[self.current_box_idx].original_size, dtype=np.float32) if self.current_box_idx < self.n_boxes else np.zeros(3, dtype=np.float32),
-            'metrics': np.array([
-                self.current_box_idx / self.n_boxes,  # Progress
-                self.successful_placements / max(1, self.current_box_idx),  # Success rate
-                self.total_volume_placed / self.max_volume,  # Volume efficiency
-                np.mean(self._get_height_map()) / self.pallet_size[2]  # Average height utilization
-            ], dtype=np.float32)
-        }
+        # 3D grid (normalized)
+        grid = self.occupied.astype(np.float32)
         
-        # Flatten for the neural network
+        # Height map (normalized)
+        height_map = self._get_height_map().astype(np.float32) / self.pallet_size[2]
+        
+        # Current box info (normalized)
+        if self.current_box_idx < self.n_boxes:
+            box = self.box_queue[self.current_box_idx]
+            box_info = np.array(box.original_size, dtype=np.float32) / 2.0  # Normalize by max dimension
+        else:
+            box_info = np.zeros(3, dtype=np.float32)
+        
+        # Metrics (already normalized)
+        metrics = np.array([
+            self.current_box_idx / self.n_boxes,  # Progress
+            self.successful_placements / max(1, self.current_box_idx),  # Success rate
+            self.total_volume_placed / self.max_volume,  # Volume efficiency
+            np.mean(height_map)  # Average height utilization
+        ], dtype=np.float32)
+        
         return np.concatenate([
-            obs['grid'].flatten(),
-            obs['height_map'].flatten(),
-            obs['current_box'],
-            obs['metrics']
+            grid.flatten(),
+            height_map.flatten(),
+            box_info,
+            metrics
         ])
 
     def is_valid_placement(self, box):
@@ -293,7 +307,6 @@ def create_optimized_dqn_model(env, neurons_per_layer):
     policy_kwargs = {
         'net_arch': net_arch,
         'activation_fn': torch.nn.ReLU,
-        'normalize_images': False,
     }
 
     model = DQN(
