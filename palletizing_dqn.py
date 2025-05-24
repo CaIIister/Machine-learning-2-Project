@@ -348,8 +348,7 @@ def create_optimized_dqn_model(env, neurons_per_layer):
         exploration_final_eps=0.02,  # Lower final exploration
         max_grad_norm=1.0,  # Gradient clipping
         verbose=0,
-        device=device,
-        optimize_memory_usage=True
+        device=device
     )
 
     return model
