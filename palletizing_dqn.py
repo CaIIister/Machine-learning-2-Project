@@ -49,16 +49,13 @@ class OptimizedPalletEnv(gym.Env):
         self.n_boxes = 100
         self.max_volume = 125  # 5*5*5
 
-        # Enhanced observation space with spatial features
-        pallet_dims = self.pallet_size[0] * self.pallet_size[1] * self.pallet_size[2]
-        height_map_dims = self.pallet_size[0] * self.pallet_size[1]
-
-        # Observation: 3D grid + height map + box info + progress metrics
-        self.observation_space = spaces.Box(
-            low=0, high=10,
-            shape=(pallet_dims + height_map_dims + 10,),  # 125 + 25 + 10 = 160
-            dtype=np.float32
-        )
+        # Enhanced observation space
+        self.observation_space = spaces.Dict({
+            'grid': spaces.Box(low=0, high=1, shape=self.pallet_size, dtype=np.float32),
+            'height_map': spaces.Box(low=0, high=self.pallet_size[2], shape=(self.pallet_size[0], self.pallet_size[1]), dtype=np.float32),
+            'current_box': spaces.Box(low=1, high=2, shape=(3,), dtype=np.float32),
+            'metrics': spaces.Box(low=0, high=1, shape=(4,), dtype=np.float32)
+        })
 
         # Action space: 25 positions
         self.action_space = spaces.Discrete(self.pallet_size[0] * self.pallet_size[1])
@@ -90,36 +87,26 @@ class OptimizedPalletEnv(gym.Env):
         return height_map
 
     def _get_obs(self):
-        # 3D occupancy grid
-        flat_occupied = self.occupied.flatten().astype(np.float32)
-
-        # Height map for spatial awareness
-        height_map = self._get_height_map().flatten().astype(np.float32)
-
-        # Current box information
-        if self.current_box_idx < self.n_boxes:
-            box = self.box_queue[self.current_box_idx]
-            box_info = np.array(list(box.original_size), dtype=np.float32)
-        else:
-            box_info = np.array([0, 0, 0], dtype=np.float32)
-
-        # Progress and performance metrics
-        progress = self.current_box_idx / self.n_boxes
-        success_rate = self.successful_placements / max(1, self.current_box_idx)
-        volume_efficiency = self.total_volume_placed / self.max_volume
-        failure_rate = self.failed_placements / max(1, self.current_box_idx)
-
-        # Spatial analysis
-        height_variance = np.var(height_map)
-        max_height = np.max(height_map)
-        avg_height = np.mean(height_map)
-
-        metrics = np.array([
-            progress, success_rate, volume_efficiency, failure_rate,
-            height_variance, max_height, avg_height
-        ], dtype=np.float32)
-
-        return np.concatenate([flat_occupied, height_map, box_info, metrics])
+        # Convert to proper observation format
+        obs = {
+            'grid': self.occupied.astype(np.float32),
+            'height_map': self._get_height_map().astype(np.float32),
+            'current_box': np.array(self.box_queue[self.current_box_idx].original_size, dtype=np.float32) if self.current_box_idx < self.n_boxes else np.zeros(3, dtype=np.float32),
+            'metrics': np.array([
+                self.current_box_idx / self.n_boxes,  # Progress
+                self.successful_placements / max(1, self.current_box_idx),  # Success rate
+                self.total_volume_placed / self.max_volume,  # Volume efficiency
+                np.mean(self._get_height_map()) / self.pallet_size[2]  # Average height utilization
+            ], dtype=np.float32)
+        }
+        
+        # Flatten for the neural network
+        return np.concatenate([
+            obs['grid'].flatten(),
+            obs['height_map'].flatten(),
+            obs['current_box'],
+            obs['metrics']
+        ])
 
     def is_valid_placement(self, box):
         (x1, x2), (y1, y2), (z1, z2) = box.get_bounds()
@@ -138,54 +125,34 @@ class OptimizedPalletEnv(gym.Env):
         return np.all(self.occupied[x1:x2, y1:y2, z1 - 1:z1] == 1)
 
     def _calculate_advanced_reward(self, box, z, placed):
-        """Advanced reward function with multiple objectives"""
+        """Simplified and more balanced reward function"""
         if not placed:
-            return -5.0  # Penalty for failed placement
+            return -1.0  # Reduced penalty for failed placement
 
         volume = box.get_volume()
-
-        # Base volume reward
-        volume_reward = volume * 15.0
-
-        # Height penalty (encourage lower placement)
-        height_penalty = -z * 2.0
-
-        # Stability reward (prefer placements that create flat surfaces)
-        stability_reward = 0
-        x, y = box.position[0], box.position[1]
-        if z == 0:  # Ground level
-            stability_reward = 5.0
+        
+        # Base reward for successful placement
+        base_reward = 2.0
+        
+        # Volume-based reward (normalized)
+        volume_reward = volume / 8.0  # Normalized by max possible box volume
+        
+        # Height efficiency reward (encourage efficient use of vertical space)
+        height_efficiency = 1.0 - (z / self.pallet_size[2])
+        height_reward = height_efficiency * 0.5
+        
+        # Stability reward
+        stability_reward = 0.0
+        if z == 0:  # Ground level placement
+            stability_reward = 0.5
         else:
-            # Check if placement creates a stable platform
-            l, w, h = box.size
-            platform_area = l * w
-            stability_reward = platform_area * 1.0
+            # Check support from below
+            x, y = box.position[0], box.position[1]
+            l, w = box.size[0], box.size[1]
+            support_area = np.sum(self.occupied[x:x+l, y:y+w, z-1]) / (l * w)
+            stability_reward = support_area * 0.5
 
-        # Compactness reward (penalize scattered placement)
-        compactness_reward = 0
-        if self.successful_placements > 0:
-            # Calculate distance to existing boxes
-            min_distance = float('inf')
-            for existing_box in self.placed_boxes[:-1]:  # Exclude current box
-                ex_x, ex_y, ex_z = existing_box.position
-                distance = abs(x - ex_x) + abs(y - ex_y) + abs(z - ex_z)
-                min_distance = min(min_distance, distance)
-
-            if min_distance <= 2:  # Adjacent or close placement
-                compactness_reward = 3.0
-            elif min_distance <= 4:
-                compactness_reward = 1.0
-
-        # Efficiency bonus
-        efficiency_bonus = 0
-        if volume == 8:  # 2x2x2 box
-            efficiency_bonus = 5.0
-        elif volume >= 4:
-            efficiency_bonus = 2.0
-
-        total_reward = (volume_reward + stability_reward +
-                        compactness_reward + efficiency_bonus + height_penalty)
-
+        total_reward = base_reward + volume_reward + height_reward + stability_reward
         return total_reward
 
     def step(self, action):
@@ -313,16 +280,15 @@ class LearningRateScheduler(BaseCallback):
 
 
 def create_optimized_dqn_model(env, neurons_per_layer):
-    """Create optimized DQN with advanced hyperparameters"""
-
-    # Network architecture: deeper networks for complex patterns
-    if neurons_per_layer <= 64:
-        net_arch = [neurons_per_layer, neurons_per_layer, neurons_per_layer // 2]
-    elif neurons_per_layer <= 256:
-        net_arch = [neurons_per_layer, neurons_per_layer, neurons_per_layer // 2, neurons_per_layer // 4]
-    else:
-        net_arch = [neurons_per_layer, neurons_per_layer, neurons_per_layer // 2,
-                    neurons_per_layer // 4, neurons_per_layer // 8]
+    """Create optimized DQN with improved hyperparameters"""
+    
+    # Deeper network architecture
+    net_arch = [
+        neurons_per_layer,
+        neurons_per_layer,
+        neurons_per_layer,
+        neurons_per_layer // 2
+    ]
 
     policy_kwargs = {
         'net_arch': net_arch,
@@ -334,19 +300,19 @@ def create_optimized_dqn_model(env, neurons_per_layer):
         "MlpPolicy",
         env,
         policy_kwargs=policy_kwargs,
-        learning_rate=2e-3,  # Higher initial learning rate
-        buffer_size=200000,  # Larger experience buffer
-        learning_starts=15000,  # More initial exploration
-        batch_size=256,  # Larger batch size for stability
-        tau=0.005,  # Soft target updates
-        gamma=0.99,  # Higher discount factor
-        train_freq=8,  # More frequent training
-        gradient_steps=2,  # Multiple gradient steps per update
-        target_update_interval=5000,  # Less frequent hard updates
-        exploration_fraction=0.6,  # Extended exploration period
+        learning_rate=1e-4,  # Lower learning rate for stability
+        buffer_size=500000,  # Larger buffer for better experience replay
+        learning_starts=50000,  # More initial exploration
+        batch_size=128,  # Smaller batch size for better generalization
+        tau=0.001,  # Slower target updates
+        gamma=0.98,  # Slightly lower discount factor
+        train_freq=4,
+        gradient_steps=4,  # More gradient steps per update
+        target_update_interval=10000,
+        exploration_fraction=0.3,  # Faster exploration decay
         exploration_initial_eps=1.0,
-        exploration_final_eps=0.02,  # Lower final exploration
-        max_grad_norm=1.0,  # Gradient clipping
+        exploration_final_eps=0.05,  # Slightly higher final exploration
+        max_grad_norm=0.5,  # Lower gradient clipping
         verbose=0,
         device=device
     )
@@ -474,13 +440,12 @@ def test_network_configuration(neurons, config_id, total_timesteps=150000):
 
 
 def run_complete_network_analysis():
-    """Run comprehensive analysis of 5 network configurations"""
-
+    """Run comprehensive analysis with increased training time"""
     print("DQN Network Architecture Analysis")
     print("=" * 50)
 
-    # Test 5 different network configurations
-    network_configs = [32, 64, 128, 256, 512]
+    # Test 5 different network configurations with more focused sizes
+    network_configs = [64, 128, 256, 384, 512]  # Adjusted network sizes
     results = {}
 
     # Random baseline
@@ -527,9 +492,9 @@ def run_complete_network_analysis():
     print(f"  Success Rate: {random_baseline['avg_success']:.3f} ± {random_baseline['std_success']:.3f}")
     print(f"  Volume Efficiency: {random_baseline['avg_efficiency']:.3f}")
 
-    # Test each network configuration
+    # Test each network configuration with increased training time
     for i, neurons in enumerate(network_configs):
-        result = test_network_configuration(neurons, i + 1, total_timesteps=150000)
+        result = test_network_configuration(neurons, i + 1, total_timesteps=300000)  # Doubled training time
         results[neurons] = result
 
     return results, random_baseline
@@ -698,7 +663,7 @@ if __name__ == "__main__":
         'random_baseline': random_baseline,
         'device_used': str(device),
         'configurations_tested': sorted(results.keys()),
-        'training_timesteps': 150000,
+        'training_timesteps': 300000,
         'environment_type': 'OptimizedPalletEnv'
     }
 
