@@ -17,6 +17,7 @@ import time
 import random
 import torch
 import pickle
+import os
 from stable_baselines3 import PPO, DQN
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.callbacks import BaseCallback
@@ -26,6 +27,16 @@ from tqdm import tqdm
 
 # Import your DQN implementation
 from palletizing_dqn import OptimizedPalletEnv, create_optimized_dqn_model
+
+# Model file paths
+MODEL_PATHS = {
+    'ga': 'models/genetic_algorithm_best.pkl',
+    'dqn': 'models/dqn_512_neurons.zip',
+    'ppo': 'models/ppo_classic.zip'
+}
+
+# Ensure models directory exists
+os.makedirs('models', exist_ok=True)
 
 
 class LossTrackingCallback(BaseCallback):
@@ -61,8 +72,8 @@ class GeneticAlgorithmPolicy:
     - Crossover: Weight averaging + mutation
     """
 
-    def __init__(self, input_dim=157, hidden_dims=[128, 64], output_dim=25,
-                 population_size=50, mutation_rate=0.1, crossover_rate=0.8):
+    def __init__(self, input_dim=157, hidden_dims=[64], output_dim=25,
+                 population_size=80, mutation_rate=0.2, crossover_rate=0.7):
         self.input_dim = input_dim
         self.hidden_dims = hidden_dims
         self.output_dim = output_dim
@@ -127,7 +138,7 @@ class GeneticAlgorithmPolicy:
         logits = self._forward_pass(self.best_individual, x)
         return int(np.argmax(logits))
 
-    def _evaluate_individual(self, individual, n_episodes=5):
+    def _evaluate_individual(self, individual, n_episodes=8):
         """Evaluate individual's fitness over multiple episodes"""
         total_fitness = 0.0
 
@@ -272,6 +283,46 @@ class GeneticAlgorithmPolicy:
 
         print(f"Training completed! Best fitness: {self.best_fitness:.4f}")
         return self.best_individual
+
+    def save_model(self, filepath):
+        """Save the best individual and training history"""
+        model_data = {
+            'best_individual': self.best_individual,
+            'best_fitness': self.best_fitness,
+            'best_fitness_history': self.best_fitness_history,
+            'avg_fitness_history': self.avg_fitness_history,
+            'generation': self.generation,
+            'input_dim': self.input_dim,
+            'hidden_dims': self.hidden_dims,
+            'output_dim': self.output_dim,
+            'population_size': self.population_size,
+            'mutation_rate': self.mutation_rate,
+            'crossover_rate': self.crossover_rate
+        }
+
+        with open(filepath, 'wb') as f:
+            pickle.dump(model_data, f)
+        print(f"GA model saved to {filepath}")
+
+    def load_model(self, filepath):
+        """Load a previously trained model"""
+        with open(filepath, 'rb') as f:
+            model_data = pickle.load(f)
+
+        self.best_individual = model_data['best_individual']
+        self.best_fitness = model_data['best_fitness']
+        self.best_fitness_history = model_data['best_fitness_history']
+        self.avg_fitness_history = model_data['avg_fitness_history']
+        self.generation = model_data['generation']
+
+        # Verify model compatibility
+        if (model_data['input_dim'] != self.input_dim or
+                model_data['hidden_dims'] != self.hidden_dims or
+                model_data['output_dim'] != self.output_dim):
+            raise ValueError("Loaded model architecture doesn't match current configuration!")
+
+        print(f"GA model loaded from {filepath}")
+        print(f"Best fitness: {self.best_fitness:.4f}, Generations trained: {self.generation}")
 
 
 def create_classic_ppo_model(env):
@@ -499,6 +550,129 @@ Success: +{(after_success - before_success):.3f}
     plt.show()
 
 
+def check_and_load_models():
+    """Check if trained models exist and return loading status"""
+    model_status = {}
+
+    for model_name, path in MODEL_PATHS.items():
+        if os.path.exists(path):
+            model_status[model_name] = True
+            print(f"✅ Found existing {model_name.upper()} model: {path}")
+        else:
+            model_status[model_name] = False
+            print(f"❌ No existing {model_name.upper()} model found: {path}")
+
+    return model_status
+
+
+def delete_saved_models(models_to_delete=None):
+    """Delete saved models to force retraining
+
+    Args:
+        models_to_delete: List of model names to delete ['ga', 'dqn', 'ppo']
+                         or None to delete all
+    """
+    if models_to_delete is None:
+        models_to_delete = list(MODEL_PATHS.keys())
+
+    deleted_count = 0
+    for model_name in models_to_delete:
+        if model_name in MODEL_PATHS:
+            path = MODEL_PATHS[model_name]
+            if os.path.exists(path):
+                os.remove(path)
+                print(f"🗑️  Deleted {model_name.upper()} model: {path}")
+                deleted_count += 1
+            else:
+                print(f"⚠️  {model_name.upper()} model not found: {path}")
+        else:
+            print(f"❌ Unknown model name: {model_name}")
+
+    if deleted_count > 0:
+        print(f"✅ Deleted {deleted_count} model(s). They will be retrained on next run.")
+    else:
+        print("ℹ️  No models were deleted.")
+
+
+def load_or_train_genetic_algorithm():
+    """Load existing GA model or train new one"""
+    ga = GeneticAlgorithmPolicy(population_size=80, mutation_rate=0.2, crossover_rate=0.7)
+
+    if os.path.exists(MODEL_PATHS['ga']):
+        print("🔄 Loading existing Genetic Algorithm model...")
+        try:
+            ga.load_model(MODEL_PATHS['ga'])
+            return ga
+        except Exception as e:
+            print(f"⚠️  Failed to load GA model: {e}")
+            print("🔄 Training new GA model...")
+    else:
+        print("🔄 Training new Genetic Algorithm model...")
+
+    # Train new model
+    ga.train(n_generations=20)
+    ga.save_model(MODEL_PATHS['ga'])
+    return ga
+
+
+def load_or_train_dqn():
+    """Load existing DQN model or train new one"""
+
+    def make_env():
+        return OptimizedPalletEnv()
+
+    dqn_env = DummyVecEnv([make_env])
+
+    if os.path.exists(MODEL_PATHS['dqn']):
+        print("🔄 Loading existing DQN model...")
+        try:
+            dqn_model = DQN.load(MODEL_PATHS['dqn'], env=dqn_env)
+            print(f"✅ DQN model loaded from {MODEL_PATHS['dqn']}")
+            return dqn_model
+        except Exception as e:
+            print(f"⚠️  Failed to load DQN model: {e}")
+            print("🔄 Training new DQN model...")
+    else:
+        print("🔄 Training new DQN model...")
+
+    # Train new model
+    dqn_model = create_optimized_dqn_model(dqn_env, 512)
+    print("   Training DQN for 250,000 timesteps...")
+    dqn_model.learn(total_timesteps=250000, progress_bar=True)
+    dqn_model.save(MODEL_PATHS['dqn'])
+    print(f"💾 DQN model saved to {MODEL_PATHS['dqn']}")
+    return dqn_model
+
+
+def load_or_train_ppo():
+    """Load existing PPO model or train new one"""
+
+    def make_env():
+        return OptimizedPalletEnv()
+
+    ppo_env = DummyVecEnv([make_env])
+
+    if os.path.exists(MODEL_PATHS['ppo']):
+        print("🔄 Loading existing PPO model...")
+        try:
+            ppo_model = PPO.load(MODEL_PATHS['ppo'], env=ppo_env)
+            print(f"✅ PPO model loaded from {MODEL_PATHS['ppo']}")
+            return ppo_model
+        except Exception as e:
+            print(f"⚠️  Failed to load PPO model: {e}")
+            print("🔄 Training new PPO model...")
+    else:
+        print("🔄 Training new PPO model...")
+
+    # Train new model
+    ppo_model = create_classic_ppo_model(ppo_env)
+    print("   Training PPO for 250,000 timesteps...")
+    ppo_model.learn(total_timesteps=250000, progress_bar=True)
+    ppo_model.save(MODEL_PATHS['ppo'])
+    print(f"💾 PPO model saved to {MODEL_PATHS['ppo']}")
+    return ppo_model
+
+
 def create_comprehensive_comparison_plots(results_dict):
     """Create comprehensive comparison visualization"""
     algorithms = list(results_dict.keys())
@@ -629,7 +803,7 @@ def print_detailed_comparison_summary(results_dict):
 
 
 def main():
-    """Enhanced main comparison function"""
+    """Enhanced main comparison function with model saving/loading"""
     print("🚀 Enhanced 3D Palletizing Algorithm Comparison")
     print("=" * 70)
     print("Main comparison: DQN vs Genetic Algorithm")
@@ -641,34 +815,26 @@ def main():
     random.seed(42)
     torch.manual_seed(42)
 
-    # Initialize algorithms
+    # Check existing models
+    print("\n🔍 Checking for existing trained models...")
+    model_status = check_and_load_models()
+
+    # Initialize algorithms (load existing or train new)
     algorithms = {}
 
     # 1. Genetic Algorithm (Primary non-RL ML method)
-    print("1. Training Genetic Algorithm...")
-    ga = GeneticAlgorithmPolicy(population_size=30, mutation_rate=0.15, crossover_rate=0.8)
-    ga.train(n_generations=15)  # Reasonable training time
-    algorithms["Genetic Algorithm"] = ga
+    print("\n1. Genetic Algorithm Setup:")
+    algorithms["Genetic Algorithm"] = load_or_train_genetic_algorithm()
 
     # 2. DQN (Primary RL method - best configuration: 512 neurons)
-    print("\n2. Training DQN (512 neurons - best configuration)...")
-
-    def make_env():
-        return OptimizedPalletEnv()
-
-    dqn_env = DummyVecEnv([make_env])
-    dqn_model = create_optimized_dqn_model(dqn_env, 512)  # Best configuration
-    print("   Training DQN for 250,000 timesteps...")
-    dqn_model.learn(total_timesteps=250000, progress_bar=True)
-    algorithms["DQN (512 neurons)"] = dqn_model
+    print("\n2. DQN Setup:")
+    algorithms["DQN (512 neurons)"] = load_or_train_dqn()
 
     # 3. PPO (Additional comparison)
-    print("\n3. Training PPO (additional comparison)...")
-    ppo_env = DummyVecEnv([make_env])
-    ppo_model = create_classic_ppo_model(ppo_env)
-    print("   Training PPO for 250,000 timesteps...")
-    ppo_model.learn(total_timesteps=250000, progress_bar=True)
-    algorithms["PPO"] = ppo_model
+    print("\n3. PPO Setup:")
+    algorithms["PPO"] = load_or_train_ppo()
+
+    print("\n🎯 All models ready for evaluation!")
 
     # Evaluate all algorithms
     print("\n🔍 Evaluating all algorithms...")
@@ -699,7 +865,9 @@ def main():
             'comparison_seed': 99,
             'environment': 'OptimizedPalletEnv',
             'dqn_neurons': 512,
-            'ga_generations': 15,
+            'ga_generations': 20,
+            'model_paths': MODEL_PATHS,
+            'models_loaded': model_status,
             'assignment_compliance': {
                 'main_comparison': 'DQN vs Genetic Algorithm',
                 'rl_algorithm': 'DQN',
@@ -713,6 +881,8 @@ def main():
 
     print("\n✅ Enhanced analysis completed!")
     print("📁 Results saved to 'enhanced_algorithm_comparison_results.pkl'")
+    print(f"📁 Models saved in: {os.path.abspath('models/')}")
+    print("\n💡 Next time you run this script, existing models will be loaded automatically!")
     print("\n🎯 Assignment Requirements Met:")
     print("   ✓ DQN (RL) vs Genetic Algorithm (non-RL ML) - Main comparison")
     print("   ✓ PPO included for additional analysis")
@@ -720,7 +890,14 @@ def main():
     print("   ✓ Figure 1 style visualization created")
     print("   ✓ Same seeds for fair comparison")
     print("   ✓ 50 episodes for statistical significance")
+    print("   ✓ Model persistence for efficient re-runs")
 
 
 if __name__ == "__main__":
+    # Optional: Uncomment any of these lines to force retraining of specific models
+    # delete_saved_models(['ga'])  # Delete only GA model
+    # delete_saved_models(['dqn'])  # Delete only DQN model
+    # delete_saved_models(['ppo'])  # Delete only PPO model
+    # delete_saved_models()  # Delete all models
+
     main()
